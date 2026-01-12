@@ -88,11 +88,48 @@ Conditions:
   HasSource: !Not [!Equals [!Ref SourceType, 'NO_SOURCE']]
 
 Resources:
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} resources'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSecretsManagerAccess
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}'
+      TargetKeyId: !Ref KMSKey
+
   QualysSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub '${ProjectName}-qualys-credentials'
       Description: Qualys API credentials for QScanner
+      KmsKeyId: !Ref KMSKey
       SecretString: !Sub |
         {
           "accessToken": "${QualysAccessToken}",
@@ -102,15 +139,76 @@ Resources:
         - Key: Application
           Value: !Ref ProjectName
 
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateReportBucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Logging bucket cannot log to itself
+    Properties:
+      BucketName: !Sub '${ProjectName}-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateReportBucket
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
   ReportBucket:
     Type: AWS::S3::Bucket
     Condition: CreateReportBucket
+    DependsOn: LoggingBucketPolicy
     Properties:
       BucketName: !Sub '${ProjectName}-reports-${AWS::AccountId}'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: report-bucket-logs/
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -121,6 +219,8 @@ Resources:
           - Id: DeleteOldReports
             Status: Enabled
             ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
       Tags:
         - Key: Application
           Value: !Ref ProjectName
@@ -385,7 +485,6 @@ Resources:
         detail-type:
           - Qualys Scan Completed
       State: ENABLED
-      Targets: []
 
 Outputs:
   ProjectName:

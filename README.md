@@ -11,47 +11,66 @@ Integrate Qualys vulnerability scanning into your AWS CodeBuild pipelines. Scan 
 - **Professional Output**: Formatted console output with severity tables
 - **Policy Evaluation**: Use Qualys policies to gate builds
 - **Threshold Gates**: Fail builds based on vulnerability counts
-- **CodePipeline Integration**: Reusable scan stages for pipelines
-- **AWS Native**: Secrets Manager, S3, EventBridge integration
+- **Multi-Region Deployment**: StackSets for org-wide rollout
+- **Enterprise Security**: KMS encryption, S3 versioning, access logging
 
 ## Quick Start
 
-### Option 1: Use the Buildspec Templates
+### Option 1: Buildspec Templates
+
+Copy a buildspec template to your project:
 
 ```bash
 cp buildspec/container-scan.yml buildspec.yml
 ```
 
-### Option 2: Deploy with CloudFormation
+### Option 2: CloudFormation (Single Account)
 
 ```bash
 aws cloudformation deploy \
   --template-file cloudformation/codebuild-project.yaml \
-  --stack-name qualys-scanner \
+  --stack-name qualys-codebuild \
   --parameter-overrides \
-    ProjectName=my-scanner \
+    ProjectName=qualys-codebuild \
     ScanType=container \
     QualysPod=US1 \
     QualysAccessToken=YOUR_TOKEN \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-### Option 3: Add to CodePipeline
+### Option 3: StackSets (Multi-Region/Org-Wide)
 
 ```bash
-aws cloudformation deploy \
-  --template-file cloudformation/codepipeline-action.yaml \
-  --stack-name qualys-pipeline-action \
-  --parameter-overrides \
-    QualysPod=US1 \
-    QualysSecretArn=arn:aws:secretsmanager:... \
-    EnableSecurityHub=true \
-  --capabilities CAPABILITY_NAMED_IAM
+aws cloudformation create-stack-set \
+  --stack-set-name qualys-codebuild \
+  --template-body file://cloudformation/stackset-template.yaml \
+  --parameters \
+    ParameterKey=QualysPod,ParameterValue=US1 \
+    ParameterKey=QualysAccessToken,ParameterValue=YOUR_TOKEN \
+    ParameterKey=ScanType,ParameterValue=container \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+  --capabilities CAPABILITY_IAM
+
+aws cloudformation create-stack-instances \
+  --stack-set-name qualys-codebuild \
+  --deployment-targets OrganizationalUnitIds=ou-xxxx-xxxxxxxx \
+  --regions us-east-1 us-west-2 eu-west-1
+```
+
+## Running a Scan
+
+```bash
+# Container scan
+aws codebuild start-build \
+  --project-name qualys-codebuild-container-us-east-1 \
+  --environment-variables-override name=IMAGE_ID,value=nginx:latest
+
+# Code scan (with source configured)
+aws codebuild start-build --project-name qualys-codebuild-code-us-east-1
 ```
 
 ## Console Output
-
-The integration provides professional formatted output in CodeBuild logs:
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -102,7 +121,7 @@ THRESHOLD EVALUATION
 |----------|----------|-------------|
 | `QUALYS_ACCESS_TOKEN` | Yes* | Qualys API access token |
 | `QUALYS_SECRET_ARN` | Yes* | Secrets Manager secret ARN |
-| `QUALYS_POD` | Yes | Platform (US1, EU1, etc.) |
+| `QUALYS_POD` | Yes | Platform (US1, US2, EU1, EU2, CA1, etc.) |
 | `IMAGE_ID` | Container | Image to scan |
 | `SCAN_PATH` | Code | Path to scan (default: `.`) |
 | `SCAN_MODE` | No | `get-report`, `evaluate-policy` |
@@ -112,95 +131,68 @@ THRESHOLD EVALUATION
 | `MAX_HIGH` | No | Threshold for high vulns |
 | `REPORT_BUCKET` | No | S3 bucket for reports |
 | `SEND_TO_SECURITY_HUB` | No | `true` to enable |
-| `SEND_EVENTBRIDGE_NOTIFICATION` | No | `true` to enable |
+
+*One of `QUALYS_ACCESS_TOKEN` or `QUALYS_SECRET_ARN` is required.
+
+### Supported Qualys Pods
+
+US1, US2, US3, US4, EU1, EU2, CA1, IN1, AU1, UK1, AE1, KSA1
+
+## Security Features
+
+All CloudFormation templates include enterprise security controls:
+
+| Feature | Implementation |
+|---------|---------------|
+| Secrets Encryption | KMS CMK with automatic rotation |
+| S3 Encryption | AES-256 server-side encryption |
+| S3 Versioning | Enabled with lifecycle policies |
+| S3 Access Logging | Dedicated logging bucket |
+| S3 Public Access | Blocked on all buckets |
+| IAM Permissions | Least privilege, scoped to resources |
 
 ## AWS Integrations
 
 ### Security Hub
 
-Import findings directly to AWS Security Hub:
+Findings are imported to AWS Security Hub in ASFF format:
 
-```yaml
-env:
-  variables:
-    SEND_TO_SECURITY_HUB: "true"
-```
-
-Findings appear in Security Hub with:
-- Severity mapping (Critical, High, Medium, Low)
-- CVE identifiers and references
-- Package and version information
-- Remediation guidance
+| Qualys Severity | Security Hub Label | Normalized Score |
+|-----------------|-------------------|------------------|
+| 5 (Critical) | CRITICAL | 90 |
+| 4 (High) | HIGH | 70 |
+| 3 (Medium) | MEDIUM | 40 |
+| 2 (Low) | LOW | 20 |
+| 1 (Info) | INFORMATIONAL | 0 |
 
 ### CodeBuild Report Groups
 
-SARIF reports are automatically uploaded to CodeBuild Report Groups:
-
-```yaml
-reports:
-  qualys-sarif-reports:
-    files:
-      - '**/*-Report.sarif.json'
-    file-format: SARIFZIP
-```
-
-View findings in the CodeBuild console under the "Reports" tab.
+SARIF reports are uploaded to CodeBuild Report Groups automatically. View findings in the CodeBuild console under the "Reports" tab.
 
 ### S3 Reports
 
-```yaml
-env:
-  variables:
-    REPORT_BUCKET: "my-security-reports"
+Reports are stored in versioned S3 buckets with the structure:
 ```
-
-### EventBridge Notifications
-
-```yaml
-env:
-  variables:
-    SEND_EVENTBRIDGE_NOTIFICATION: "true"
-```
-
-## CodePipeline Integration
-
-Deploy the CodePipeline action template:
-
-```bash
-aws cloudformation deploy \
-  --template-file cloudformation/codepipeline-action.yaml \
-  --stack-name qualys-pipeline \
-  --parameter-overrides \
-    QualysSecretArn=arn:aws:secretsmanager:us-east-1:123456789:secret:qualys \
-    EnableSecurityHub=true \
-  --capabilities CAPABILITY_NAMED_IAM
-```
-
-Add to your pipeline:
-
-```yaml
-- Name: SecurityScan
-  Actions:
-    - Name: QualysCodeScan
-      ActionTypeId:
-        Category: Test
-        Owner: AWS
-        Provider: CodeBuild
-        Version: '1'
-      Configuration:
-        ProjectName: qualys-pipeline-code-scan
-      InputArtifacts:
-        - Name: SourceOutput
-      OutputArtifacts:
-        - Name: ScanReports
+s3://{bucket}/{project}/{timestamp}/*.json
 ```
 
 ## CloudFormation Templates
 
 | Template | Description |
 |----------|-------------|
-| `codebuild-project.yaml` | Standalone CodeBuild project |
+| `codebuild-project.yaml` | Standalone CodeBuild project with full security controls |
 | `codepipeline-action.yaml` | Reusable CodePipeline action |
+| `stackset-template.yaml` | Multi-region org-wide deployment |
+
+### Resources Created
+
+Each deployment creates:
+- KMS key with automatic rotation
+- Secrets Manager secret (KMS encrypted)
+- S3 report bucket (versioned, encrypted, logging enabled)
+- S3 logging bucket
+- CodeBuild project
+- IAM role with scoped permissions
 
 ## Project Structure
 
@@ -222,30 +214,16 @@ qualys-codebuild/
 │   │   └── index.ts
 │   └── code-scan/
 │       └── index.ts
-├── scripts/
-│   └── qscanner-codebuild.sh
 ├── buildspec/
 │   ├── container-scan.yml
 │   └── code-scan.yml
 ├── cloudformation/
 │   ├── codebuild-project.yaml
-│   └── codepipeline-action.yaml
-├── docs/
-│   └── technical-architecture.md
-└── README.md
+│   ├── codepipeline-action.yaml
+│   └── stackset-template.yaml
+└── docs/
+    └── technical-architecture.md
 ```
-
-## Plugin vs Code Approach
-
-**AWS CodeBuild does not have a plugin marketplace** like Jenkins or GitHub Actions. Integration options:
-
-| Approach | Status | Description |
-|----------|--------|-------------|
-| Buildspec Templates | ✅ Included | Copy-paste YAML templates |
-| Shell Script | ✅ Included | Curl and run in any buildspec |
-| CloudFormation | ✅ Included | Infrastructure as code |
-| CodePipeline Action | ✅ Included | Reusable pipeline stages |
-| AWS Marketplace | Future | Partner solution listing |
 
 ## Requirements
 
@@ -259,8 +237,7 @@ qualys-codebuild/
 ```bash
 npm install
 npm run build
-npm run container-scan
-npm run code-scan
+npm run lint
 ```
 
 ## License

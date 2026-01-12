@@ -258,8 +258,7 @@ export class QScannerRunner {
             fs.unlinkSync(path.join(this.workDir, file));
           }
         }
-      } catch {
-      }
+      } catch { /* ignore cleanup errors */ }
     }
   }
 
