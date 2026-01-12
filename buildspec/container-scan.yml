@@ -1,0 +1,132 @@
+version: 0.2
+
+env:
+  secrets-manager:
+    QUALYS_ACCESS_TOKEN: "${QUALYS_SECRET_ARN}"
+  variables:
+    QUALYS_POD: "US1"
+    SCAN_MODE: "get-report"
+    SCAN_TYPES: "pkg,secret"
+    OUTPUT_DIR: "qualys-reports"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+
+  pre_build:
+    commands:
+      - echo "Setting up Qualys QScanner..."
+      - |
+        QSCANNER_DIR="/tmp/qscanner-codebuild"
+        QSCANNER_BINARY="${QSCANNER_DIR}/qscanner"
+        QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz"
+        QSCANNER_SHA256="1a31b854154ee4594bb94e28aa86460b14a75687085d097f949e91c5fd00413d"
+
+        mkdir -p "${QSCANNER_DIR}"
+
+        if [ ! -x "${QSCANNER_BINARY}" ]; then
+          echo "Downloading QScanner binary..."
+          curl -sL "${QSCANNER_URL}" -o "${QSCANNER_DIR}/qscanner.gz"
+
+          echo "Verifying checksum..."
+          ACTUAL_SHA256=$(sha256sum "${QSCANNER_DIR}/qscanner.gz" | cut -d' ' -f1)
+          if [ "${ACTUAL_SHA256}" != "${QSCANNER_SHA256}" ]; then
+            echo "ERROR: Checksum mismatch!"
+            exit 1
+          fi
+
+          echo "Extracting binary..."
+          gunzip -f "${QSCANNER_DIR}/qscanner.gz"
+          chmod +x "${QSCANNER_BINARY}"
+        fi
+
+        echo "QScanner ready: ${QSCANNER_BINARY}"
+
+  build:
+    commands:
+      - echo "Scanning container image ${IMAGE_ID}..."
+      - mkdir -p ${OUTPUT_DIR}
+      - |
+        QSCANNER_BINARY="/tmp/qscanner-codebuild/qscanner"
+
+        CMD="${QSCANNER_BINARY} --pod ${QUALYS_POD} --mode ${SCAN_MODE}"
+        CMD="${CMD} --output-dir ${OUTPUT_DIR}"
+        CMD="${CMD} --format json,sarif --report-format sarif,json"
+
+        if [ -n "${SCAN_TYPES}" ]; then
+          CMD="${CMD} --scan-types ${SCAN_TYPES}"
+        fi
+
+        if [ -n "${STORAGE_DRIVER}" ] && [ "${STORAGE_DRIVER}" != "none" ]; then
+          CMD="${CMD} --storage-driver ${STORAGE_DRIVER}"
+        fi
+
+        if [ -n "${PLATFORM}" ]; then
+          CMD="${CMD} --platform ${PLATFORM}"
+        fi
+
+        if [ -n "${POLICY_TAGS}" ]; then
+          CMD="${CMD} --policy-tags ${POLICY_TAGS}"
+        fi
+
+        CMD="${CMD} image ${IMAGE_ID}"
+
+        echo "Executing: ${CMD}"
+
+        set +e
+        eval "${CMD}"
+        SCAN_EXIT_CODE=$?
+        set -e
+
+        echo "Scan completed with exit code: ${SCAN_EXIT_CODE}"
+
+        if [ ${SCAN_EXIT_CODE} -eq 0 ]; then
+          echo "SCAN PASSED"
+        elif [ ${SCAN_EXIT_CODE} -eq 42 ]; then
+          echo "SCAN FAILED - Policy evaluation: DENY"
+          exit 1
+        elif [ ${SCAN_EXIT_CODE} -eq 43 ]; then
+          echo "SCAN COMPLETED - Policy evaluation: AUDIT"
+        else
+          echo "SCAN FAILED - Exit code: ${SCAN_EXIT_CODE}"
+          exit ${SCAN_EXIT_CODE}
+        fi
+
+  post_build:
+    commands:
+      - echo "Processing scan results..."
+      - |
+        if [ -n "${REPORT_BUCKET}" ]; then
+          echo "Uploading reports to S3..."
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          PREFIX="${CODEBUILD_BUILD_PROJECT}/${CODEBUILD_BUILD_NUMBER}/${TIMESTAMP}"
+
+          for file in ${OUTPUT_DIR}/*.json ${OUTPUT_DIR}/*.sarif.json; do
+            if [ -f "$file" ]; then
+              aws s3 cp "$file" "s3://${REPORT_BUCKET}/${PREFIX}/$(basename $file)"
+            fi
+          done
+
+          echo "Reports uploaded to s3://${REPORT_BUCKET}/${PREFIX}/"
+        fi
+      - echo "Container scan complete!"
+
+artifacts:
+  files:
+    - '**/*.json'
+    - '**/*.sarif.json'
+  base-directory: ${OUTPUT_DIR}
+  discard-paths: no
+  name: qualys-scan-reports
+
+reports:
+  qualys-sarif-reports:
+    files:
+      - '**/*-Report.sarif.json'
+    base-directory: ${OUTPUT_DIR}
+    file-format: SARIFZIP
+
+cache:
+  paths:
+    - '/tmp/qscanner-codebuild/**/*'

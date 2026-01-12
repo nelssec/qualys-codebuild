@@ -1,0 +1,418 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys QScanner CodeBuild Project with Secrets Manager and S3 integration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the CodeBuild project
+    Default: qualys-scanner
+
+  ScanType:
+    Type: String
+    Description: Type of scan to perform
+    AllowedValues:
+      - container
+      - code
+    Default: container
+
+  QualysPod:
+    Type: String
+    Description: Qualys platform POD
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - EU1
+      - EU2
+      - CA1
+      - IN1
+      - AU1
+      - UK1
+      - AE1
+      - KSA1
+    Default: US1
+
+  QualysAccessToken:
+    Type: String
+    Description: Qualys API access token (will be stored in Secrets Manager)
+    NoEcho: true
+
+  SourceLocation:
+    Type: String
+    Description: Source repository URL (e.g., https://github.com/org/repo.git)
+    Default: ''
+
+  SourceType:
+    Type: String
+    Description: Type of source provider
+    AllowedValues:
+      - CODECOMMIT
+      - CODEPIPELINE
+      - GITHUB
+      - GITHUB_ENTERPRISE
+      - BITBUCKET
+      - S3
+      - NO_SOURCE
+    Default: NO_SOURCE
+
+  ComputeType:
+    Type: String
+    Description: CodeBuild compute type
+    AllowedValues:
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+    Default: BUILD_GENERAL1_SMALL
+
+  EnableReportBucket:
+    Type: String
+    Description: Create S3 bucket for scan reports
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+  EnableEventBridgeNotifications:
+    Type: String
+    Description: Send EventBridge notifications on scan completion
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+Conditions:
+  CreateReportBucket: !Equals [!Ref EnableReportBucket, 'true']
+  EnableEventBridge: !Equals [!Ref EnableEventBridgeNotifications, 'true']
+  IsContainerScan: !Equals [!Ref ScanType, 'container']
+  HasSource: !Not [!Equals [!Ref SourceType, 'NO_SOURCE']]
+
+Resources:
+  QualysSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-qualys-credentials'
+      Description: Qualys API credentials for QScanner
+      SecretString: !Sub |
+        {
+          "accessToken": "${QualysAccessToken}",
+          "pod": "${QualysPod}"
+        }
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateReportBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-reports-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}:*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref QualysSecret
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource:
+                  - !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}-*'
+        - !If
+          - CreateReportBucket
+          - PolicyName: S3ReportBucketPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    - !Sub '${ReportBucket.Arn}/*'
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                  Resource:
+                    - !GetAtt ReportBucket.Arn
+          - !Ref AWS::NoValue
+        - !If
+          - EnableEventBridge
+          - PolicyName: EventBridgePolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - events:PutEvents
+                  Resource:
+                    - !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+          - !Ref AWS::NoValue
+        - !If
+          - IsContainerScan
+          - PolicyName: ECRPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ecr:GetAuthorizationToken
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - ecr:BatchCheckLayerAvailability
+                    - ecr:GetDownloadUrlForLayer
+                    - ecr:BatchGetImage
+                  Resource: '*'
+          - !Ref AWS::NoValue
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      Description: !Sub 'Qualys ${ScanType} scan project'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref ComputeType
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: !If [IsContainerScan, true, false]
+        EnvironmentVariables:
+          - Name: QUALYS_POD
+            Value: !Ref QualysPod
+          - Name: QUALYS_SECRET_ARN
+            Value: !Ref QualysSecret
+          - Name: SCAN_MODE
+            Value: get-report
+          - Name: SCAN_TYPES
+            Value: pkg,secret
+          - Name: OUTPUT_DIR
+            Value: qualys-reports
+          - !If
+            - CreateReportBucket
+            - Name: REPORT_BUCKET
+              Value: !Ref ReportBucket
+            - !Ref AWS::NoValue
+          - !If
+            - EnableEventBridge
+            - Name: SEND_EVENTBRIDGE_NOTIFICATION
+              Value: 'true'
+            - !Ref AWS::NoValue
+      Source:
+        Type: !Ref SourceType
+        Location: !If [HasSource, !Ref SourceLocation, !Ref 'AWS::NoValue']
+        BuildSpec: !If
+          - IsContainerScan
+          - !Sub |
+            version: 0.2
+            env:
+              secrets-manager:
+                QUALYS_ACCESS_TOKEN: ${QualysSecret}:accessToken
+            phases:
+              pre_build:
+                commands:
+                  - |
+                    QSCANNER_DIR="/tmp/qscanner-codebuild"
+                    QSCANNER_BINARY="${!QSCANNER_DIR}/qscanner"
+                    QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz"
+                    QSCANNER_SHA256="1a31b854154ee4594bb94e28aa86460b14a75687085d097f949e91c5fd00413d"
+                    mkdir -p "${!QSCANNER_DIR}"
+                    if [ ! -x "${!QSCANNER_BINARY}" ]; then
+                      curl -sL "${!QSCANNER_URL}" -o "${!QSCANNER_DIR}/qscanner.gz"
+                      ACTUAL_SHA256=$(sha256sum "${!QSCANNER_DIR}/qscanner.gz" | cut -d' ' -f1)
+                      if [ "${!ACTUAL_SHA256}" != "${!QSCANNER_SHA256}" ]; then
+                        echo "ERROR: Checksum mismatch!"
+                        exit 1
+                      fi
+                      gunzip -f "${!QSCANNER_DIR}/qscanner.gz"
+                      chmod +x "${!QSCANNER_BINARY}"
+                    fi
+              build:
+                commands:
+                  - mkdir -p ${!OUTPUT_DIR}
+                  - |
+                    /tmp/qscanner-codebuild/qscanner \
+                      --pod ${!QUALYS_POD} \
+                      --mode ${!SCAN_MODE} \
+                      --scan-types ${!SCAN_TYPES} \
+                      --format json,sarif \
+                      --report-format sarif,json \
+                      --output-dir ${!OUTPUT_DIR} \
+                      image ${!IMAGE_ID}
+              post_build:
+                commands:
+                  - |
+                    if [ -n "${!REPORT_BUCKET}" ]; then
+                      TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+                      PREFIX="${!CODEBUILD_BUILD_PROJECT}/${!CODEBUILD_BUILD_NUMBER}/${!TIMESTAMP}"
+                      aws s3 cp ${!OUTPUT_DIR}/ s3://${!REPORT_BUCKET}/${!PREFIX}/ --recursive --include "*.json"
+                    fi
+            artifacts:
+              files:
+                - '**/*.json'
+              base-directory: ${!OUTPUT_DIR}
+            reports:
+              qualys-sarif:
+                files:
+                  - '**/*-Report.sarif.json'
+                base-directory: ${!OUTPUT_DIR}
+                file-format: SARIFZIP
+          - !Sub |
+            version: 0.2
+            env:
+              secrets-manager:
+                QUALYS_ACCESS_TOKEN: ${QualysSecret}:accessToken
+            phases:
+              pre_build:
+                commands:
+                  - |
+                    QSCANNER_DIR="/tmp/qscanner-codebuild"
+                    QSCANNER_BINARY="${!QSCANNER_DIR}/qscanner"
+                    QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz"
+                    QSCANNER_SHA256="1a31b854154ee4594bb94e28aa86460b14a75687085d097f949e91c5fd00413d"
+                    mkdir -p "${!QSCANNER_DIR}"
+                    if [ ! -x "${!QSCANNER_BINARY}" ]; then
+                      curl -sL "${!QSCANNER_URL}" -o "${!QSCANNER_DIR}/qscanner.gz"
+                      ACTUAL_SHA256=$(sha256sum "${!QSCANNER_DIR}/qscanner.gz" | cut -d' ' -f1)
+                      if [ "${!ACTUAL_SHA256}" != "${!QSCANNER_SHA256}" ]; then
+                        echo "ERROR: Checksum mismatch!"
+                        exit 1
+                      fi
+                      gunzip -f "${!QSCANNER_DIR}/qscanner.gz"
+                      chmod +x "${!QSCANNER_BINARY}"
+                    fi
+              build:
+                commands:
+                  - mkdir -p ${!OUTPUT_DIR}
+                  - |
+                    SCAN_TARGET="${!SCAN_PATH:-${!CODEBUILD_SRC_DIR:-.}}"
+                    /tmp/qscanner-codebuild/qscanner \
+                      --pod ${!QUALYS_POD} \
+                      --mode ${!SCAN_MODE} \
+                      --scan-types ${!SCAN_TYPES} \
+                      --format json,sarif \
+                      --report-format sarif,json \
+                      --output-dir ${!OUTPUT_DIR} \
+                      repo ${!SCAN_TARGET}
+              post_build:
+                commands:
+                  - |
+                    if [ -n "${!REPORT_BUCKET}" ]; then
+                      TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+                      PREFIX="${!CODEBUILD_BUILD_PROJECT}/${!CODEBUILD_BUILD_NUMBER}/${!TIMESTAMP}"
+                      aws s3 cp ${!OUTPUT_DIR}/ s3://${!REPORT_BUCKET}/${!PREFIX}/ --recursive --include "*.json"
+                    fi
+            artifacts:
+              files:
+                - '**/*.json'
+              base-directory: ${!OUTPUT_DIR}
+            reports:
+              qualys-sarif:
+                files:
+                  - '**/*-Report.sarif.json'
+                base-directory: ${!OUTPUT_DIR}
+                file-format: SARIFZIP
+      TimeoutInMinutes: 30
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_CUSTOM_CACHE
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${ProjectName}'
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+
+  ScanNotificationRule:
+    Type: AWS::Events::Rule
+    Condition: EnableEventBridge
+    Properties:
+      Name: !Sub '${ProjectName}-scan-notification'
+      Description: Rule to capture Qualys scan completion events
+      EventPattern:
+        source:
+          - qualys.codebuild
+        detail-type:
+          - Qualys Scan Completed
+      State: ENABLED
+      Targets: []
+
+Outputs:
+  ProjectName:
+    Description: CodeBuild project name
+    Value: !Ref CodeBuildProject
+
+  ProjectArn:
+    Description: CodeBuild project ARN
+    Value: !GetAtt CodeBuildProject.Arn
+
+  SecretArn:
+    Description: Secrets Manager secret ARN for Qualys credentials
+    Value: !Ref QualysSecret
+
+  ReportBucketName:
+    Condition: CreateReportBucket
+    Description: S3 bucket for scan reports
+    Value: !Ref ReportBucket
+
+  ReportBucketArn:
+    Condition: CreateReportBucket
+    Description: S3 bucket ARN for scan reports
+    Value: !GetAtt ReportBucket.Arn
+
+  StartBuildCommand:
+    Description: AWS CLI command to start a build
+    Value: !If
+      - IsContainerScan
+      - !Sub 'aws codebuild start-build --project-name ${ProjectName} --environment-variables-override name=IMAGE_ID,value=YOUR_IMAGE:TAG'
+      - !Sub 'aws codebuild start-build --project-name ${ProjectName}'

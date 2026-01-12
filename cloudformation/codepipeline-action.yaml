@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys QScanner Custom Action for AWS CodePipeline'
+
+Parameters:
+  ActionProviderName:
+    Type: String
+    Description: Name for the custom action provider
+    Default: QualysScanner
+
+  ActionVersion:
+    Type: String
+    Description: Version of the custom action
+    Default: '1'
+
+  QualysPod:
+    Type: String
+    Description: Default Qualys platform POD
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - EU1
+      - EU2
+      - CA1
+      - IN1
+      - AU1
+      - UK1
+      - AE1
+      - KSA1
+    Default: US1
+
+  QualysSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret containing Qualys credentials
+
+  EnableSecurityHub:
+    Type: String
+    Description: Enable Security Hub integration
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  ReportBucketName:
+    Type: String
+    Description: S3 bucket for scan reports (leave empty to create new)
+    Default: ''
+
+Conditions:
+  CreateReportBucket: !Equals [!Ref ReportBucketName, '']
+  EnableSecurityHubIntegration: !Equals [!Ref EnableSecurityHub, 'true']
+
+Resources:
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateReportBucket
+    Properties:
+      BucketName: !Sub 'qualys-pipeline-reports-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'qualys-pipeline-action-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref QualysSecretArn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !If
+                    - CreateReportBucket
+                    - !Sub '${ReportBucket.Arn}/*'
+                    - !Sub 'arn:aws:s3:::${ReportBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                Resource: '*'
+        - !If
+          - EnableSecurityHubIntegration
+          - PolicyName: SecurityHubPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - securityhub:BatchImportFindings
+                  Resource: '*'
+          - !Ref AWS::NoValue
+
+  ContainerScanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: qualys-pipeline-container-scan
+      Description: Qualys container scanning for CodePipeline
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: QUALYS_POD
+            Value: !Ref QualysPod
+          - Name: QUALYS_SECRET_ARN
+            Value: !Ref QualysSecretArn
+          - Name: REPORT_BUCKET
+            Value: !If [CreateReportBucket, !Ref ReportBucket, !Ref ReportBucketName]
+          - Name: SEND_TO_SECURITY_HUB
+            Value: !Ref EnableSecurityHub
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          env:
+            secrets-manager:
+              QUALYS_ACCESS_TOKEN: ${QUALYS_SECRET_ARN}:accessToken
+          phases:
+            pre_build:
+              commands:
+                - |
+                  QSCANNER_DIR="/tmp/qscanner"
+                  QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz"
+                  mkdir -p $QSCANNER_DIR
+                  curl -sL $QSCANNER_URL | gunzip > $QSCANNER_DIR/qscanner
+                  chmod +x $QSCANNER_DIR/qscanner
+            build:
+              commands:
+                - mkdir -p qualys-reports
+                - |
+                  /tmp/qscanner/qscanner \
+                    --pod $QUALYS_POD \
+                    --mode get-report \
+                    --scan-types pkg,secret \
+                    --format json,sarif \
+                    --report-format sarif,json \
+                    --output-dir qualys-reports \
+                    image $IMAGE_ID
+            post_build:
+              commands:
+                - |
+                  if [ -n "$REPORT_BUCKET" ]; then
+                    TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+                    aws s3 cp qualys-reports/ s3://$REPORT_BUCKET/container-scans/$TIMESTAMP/ --recursive
+                  fi
+          reports:
+            qualys-findings:
+              files:
+                - '**/*-Report.sarif.json'
+              base-directory: qualys-reports
+              file-format: SARIFZIP
+          artifacts:
+            files:
+              - '**/*.json'
+            base-directory: qualys-reports
+      TimeoutInMinutes: 30
+
+  CodeScanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: qualys-pipeline-code-scan
+      Description: Qualys code/SCA scanning for CodePipeline
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: QUALYS_POD
+            Value: !Ref QualysPod
+          - Name: QUALYS_SECRET_ARN
+            Value: !Ref QualysSecretArn
+          - Name: REPORT_BUCKET
+            Value: !If [CreateReportBucket, !Ref ReportBucket, !Ref ReportBucketName]
+          - Name: SEND_TO_SECURITY_HUB
+            Value: !Ref EnableSecurityHub
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          env:
+            secrets-manager:
+              QUALYS_ACCESS_TOKEN: ${QUALYS_SECRET_ARN}:accessToken
+          phases:
+            pre_build:
+              commands:
+                - |
+                  QSCANNER_DIR="/tmp/qscanner"
+                  QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz"
+                  mkdir -p $QSCANNER_DIR
+                  curl -sL $QSCANNER_URL | gunzip > $QSCANNER_DIR/qscanner
+                  chmod +x $QSCANNER_DIR/qscanner
+            build:
+              commands:
+                - mkdir -p qualys-reports
+                - |
+                  /tmp/qscanner/qscanner \
+                    --pod $QUALYS_POD \
+                    --mode get-report \
+                    --scan-types pkg,secret \
+                    --format json,sarif \
+                    --report-format sarif,json \
+                    --output-dir qualys-reports \
+                    repo .
+            post_build:
+              commands:
+                - |
+                  if [ -n "$REPORT_BUCKET" ]; then
+                    TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+                    aws s3 cp qualys-reports/ s3://$REPORT_BUCKET/code-scans/$TIMESTAMP/ --recursive
+                  fi
+          reports:
+            qualys-findings:
+              files:
+                - '**/*-Report.sarif.json'
+              base-directory: qualys-reports
+              file-format: SARIFZIP
+          artifacts:
+            files:
+              - '**/*.json'
+            base-directory: qualys-reports
+      TimeoutInMinutes: 30
+
+Outputs:
+  ContainerScanProjectName:
+    Description: CodeBuild project for container scanning in pipelines
+    Value: !Ref ContainerScanProject
+
+  CodeScanProjectName:
+    Description: CodeBuild project for code scanning in pipelines
+    Value: !Ref CodeScanProject
+
+  ReportBucketName:
+    Description: S3 bucket for scan reports
+    Value: !If [CreateReportBucket, !Ref ReportBucket, !Ref ReportBucketName]
+
+  PipelineExample:
+    Description: Example pipeline stage configuration
+    Value: !Sub |
+      - Name: SecurityScan
+        Actions:
+          - Name: QualysCodeScan
+            ActionTypeId:
+              Category: Test
+              Owner: AWS
+              Provider: CodeBuild
+              Version: '1'
+            Configuration:
+              ProjectName: ${CodeScanProject}
+            InputArtifacts:
+              - Name: SourceOutput
+            OutputArtifacts:
+              - Name: ScanReports
