@@ -2,9 +2,9 @@
 
 set -e
 
-QSCANNER_VERSION="latest"
+QSCANNER_VERSION="4.8.0-2"
 QSCANNER_BINARY_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz"
-QSCANNER_SHA256="1a31b854154ee4594bb94e28aa86460b14a75687085d097f949e91c5fd00413d"
+QSCANNER_SHA256="2d1ffb89cc97bdb19bc3f255164678319bd31a220c7028c602b7f81ba9198dba"
 QSCANNER_DIR="${QSCANNER_DIR:-/tmp/qscanner-codebuild}"
 QSCANNER_BINARY="${QSCANNER_DIR}/qscanner"
 
