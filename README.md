@@ -1,5 +1,7 @@
 # Qualys QScanner for AWS CodeBuild
 
+> ⚠️ **Unofficial project.** This is a personal project and is not affiliated with, endorsed by, or supported by Qualys, Inc.
+
 Integrate Qualys vulnerability scanning into your AWS CodeBuild pipelines. Scan container images and source code for security vulnerabilities, secrets, and compliance issues.
 
 ## Features
